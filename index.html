@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Order Scanner</title>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, sans-serif; background:#f2f4f7; color:#1b1f24; }
+  header { background:#1f4e79; color:#fff; padding:12px 16px; font-weight:600; }
+  nav { display:flex; background:#fff; border-bottom:1px solid #d5d9de; }
+  nav button { flex:1; padding:14px; border:0; background:none; font-size:16px; border-bottom:3px solid transparent; }
+  nav button.active { border-bottom-color:#1f4e79; color:#1f4e79; font-weight:600; }
+  section { display:none; padding:14px; }
+  section.active { display:block; }
+  .card { background:#fff; border-radius:10px; padding:12px; margin-bottom:12px; box-shadow:0 1px 3px rgba(0,0,0,.08); }
+  button.btn { width:100%; padding:14px; font-size:16px; border:0; border-radius:8px; background:#1f4e79; color:#fff; margin-top:8px; }
+  button.btn.secondary { background:#6b7785; }
+  button.btn.danger { background:#b3261e; }
+  input[type=text] { width:100%; padding:12px; font-size:15px; border:1px solid #c5cbd3; border-radius:8px; }
+  #reader { width:100%; border-radius:8px; overflow:hidden; }
+  #result { border-radius:12px; padding:22px 14px; text-align:center; background:#e6e9ee; min-height:130px;
+            display:flex; flex-direction:column; justify-content:center; transition:background .15s; }
+  #result.ok { background:#2e9e4f; color:#fff; }
+  #result.bad { background:#d32f2f; color:#fff; }
+  #result .big { font-size:28px; font-weight:700; word-break:break-word; }
+  #result .small { font-size:15px; opacity:.9; margin-top:6px; }
+  .row { display:flex; align-items:center; padding:10px 6px; border-bottom:1px solid #eceff3; gap:10px; }
+  .row .num { font-weight:600; min-width:90px; }
+  .row .name { flex:1; word-break:break-word; }
+  .row .st { font-size:20px; }
+  .row.done { background:#e8f5ec; }
+  #status { font-size:14px; color:#4a5560; margin-top:6px; }
+  .count { font-weight:600; margin-bottom:8px; }
+</style>
+</head>
+<body>
+<header>Order Scanner</header>
+<nav>
+  <button id="tab-scan" class="active">Scan</button>
+  <button id="tab-list">Orders</button>
+  <button id="tab-file">File</button>
+</nav>
+
+<section id="scan" class="active">
+  <div id="result"><div class="big">Load a file first</div><div class="small">Go to the File tab</div></div>
+  <button class="btn" id="startBtn">Start scanner</button>
+  <button class="btn secondary" id="stopBtn" style="display:none">Stop scanner</button>
+  <div class="card" style="margin-top:12px"><div id="reader"></div></div>
+</section>
+
+<section id="list">
+  <div class="card">
+    <div class="count" id="count"></div>
+    <input type="text" id="filter" placeholder="Search order number or name...">
+  </div>
+  <div class="card" id="rows"></div>
+  <button class="btn danger" id="resetBtn">Reset scanned status</button>
+</section>
+
+<section id="file">
+  <div class="card">
+    <b>Option A: local Excel file</b>
+    <input type="file" id="fileInput" accept=".xlsx,.xls,.csv" style="display:none">
+    <button class="btn" id="pickBtn">Select Excel file</button>
+  </div>
+  <div class="card">
+    <b>Option B: Excel file in OneDrive / SharePoint</b>
+    <p style="font-size:13px;margin:6px 0">Paste the sharing link of the file (set to "Anyone with the link can view", if your company allows it).</p>
+    <input type="text" id="urlInput" placeholder="https://...sharepoint.com/...">
+    <button class="btn" id="loadUrlBtn">Load from link</button>
+    <button class="btn secondary" id="refreshBtn">Refresh from saved link</button>
+  </div>
+  <div id="status"></div>
+</section>
+
+<script>
+// ---------- state ----------
+let orders = [];            // {num, name}
+let scanned = {};           // num -> true
+let scanner = null;
+let lastCode = "", lastTime = 0;
+
+const $ = id => document.getElementById(id);
+const store = {
+  get(k, d){ try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch(e){ return d; } },
+  set(k, v){ try { localStorage.setItem(k, JSON.stringify(v)); } catch(e){} }
+};
+
+// ---------- tabs ----------
+["scan","list","file"].forEach(t => {
+  $("tab-"+t).onclick = () => {
+    document.querySelectorAll("nav button").forEach(b => b.classList.remove("active"));
+    document.querySelectorAll("section").forEach(s => s.classList.remove("active"));
+    $("tab-"+t).classList.add("active"); $(t).classList.add("active");
+    if (t === "list") renderList();
+    if (t !== "scan") stopScanner();
+  };
+});
+
+// ---------- sound / vibration ----------
+let audioCtx;
+function beep(ok) {
+  try {
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.connect(g); g.connect(audioCtx.destination);
+    g.gain.value = 0.3;
+    if (ok) { o.type = "sine"; o.frequency.value = 1000; o.start(); o.stop(audioCtx.currentTime + 0.15); }
+    else { o.type = "sawtooth"; o.frequency.value = 160; o.start(); o.stop(audioCtx.currentTime + 0.7); }
+  } catch(e) {}
+  try { navigator.vibrate && navigator.vibrate(ok ? 80 : [200,100,200]); } catch(e){}
+}
+
+// ---------- parse excel ----------
+function loadWorkbook(data) {
+  const wb = XLSX.read(data, { type: "array" });
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  const rows = XLSX.utils.sheet_to_json(ws, { defval: "" });
+  if (!rows.length) throw new Error("The file is empty.");
+  const keys = Object.keys(rows[0]);
+  const low = keys.map(k => k.toLowerCase().trim());
+  let kNum = keys[low.findIndex(k => k.includes("order") && (k.includes("num") || k.includes("no")))];
+  let kName = keys[low.findIndex(k => k.includes("order") && k.includes("name"))];
+  if (!kNum) kNum = keys[0];
+  if (!kName) kName = keys[1] || keys[0];
+  orders = rows
+    .map(r => ({ num: String(r[kNum]).trim(), name: String(r[kName]).trim() }))
+    .filter(o => o.num);
+  scanned = store.get("scanned", {});
+  // drop scanned entries that no longer exist
+  const valid = new Set(orders.map(o => o.num));
+  Object.keys(scanned).forEach(k => { if (!valid.has(k)) delete scanned[k]; });
+  store.set("scanned", scanned);
+  setResult("", "Ready", orders.length + " orders loaded");
+  $("status").textContent = "Loaded " + orders.length + " orders (columns: " + kNum + " / " + kName + ").";
+}
+
+$("pickBtn").onclick = () => $("fileInput").click();
+$("fileInput").onchange = async e => {
+  const f = e.target.files[0]; if (!f) return;
+  try { loadWorkbook(new Uint8Array(await f.arrayBuffer())); store.set("src", "file"); }
+  catch(err) { $("status").textContent = "Error: " + err.message; }
+};
+
+async function loadFromUrl(url) {
+  $("status").textContent = "Downloading...";
+  try {
+    let u = url.trim();
+    if (!/[?&]download=1/.test(u)) u += (u.includes("?") ? "&" : "?") + "download=1";
+    const res = await fetch(u);
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    loadWorkbook(new Uint8Array(await res.arrayBuffer()));
+    store.set("url", url.trim());
+  } catch(err) {
+    $("status").textContent = "Could not load link: " + err.message +
+      ". (If this happens in a browser it is usually CORS; in the Android app it works if the link allows anonymous access.)";
+  }
+}
+$("loadUrlBtn").onclick = () => { const u = $("urlInput").value; if (u) loadFromUrl(u); };
+$("refreshBtn").onclick = () => { const u = store.get("url", ""); if (u) loadFromUrl(u); else $("status").textContent = "No saved link yet."; };
+$("urlInput").value = store.get("url", "");
+
+// ---------- scanning ----------
+function setResult(cls, big, small) {
+  const r = $("result");
+  r.className = cls;
+  r.innerHTML = '<div class="big"></div><div class="small"></div>';
+  r.querySelector(".big").textContent = big;
+  r.querySelector(".small").textContent = small || "";
+}
+
+function onCode(code) {
+  code = String(code).trim();
+  const now = Date.now();
+  if (code === lastCode && now - lastTime < 1500) return;
+  lastCode = code; lastTime = now;
+  if (!orders.length) { setResult("bad", "No file loaded", "Go to the File tab"); beep(false); return; }
+  const o = orders.find(x => x.num === code);
+  if (o) {
+    const again = scanned[code];
+    scanned[code] = true; store.set("scanned", scanned);
+    setResult("ok", o.name, "Order " + o.num + (again ? " (already scanned)" : ""));
+    beep(true);
+  } else {
+    setResult("bad", "NOT IN FILE", "Code: " + code);
+    beep(false);
+  }
+}
+
+async function startScanner() {
+  if (scanner) return;
+  scanner = new Html5Qrcode("reader");
+  try {
+    await scanner.start({ facingMode: "environment" },
+      { fps: 10, qrbox: { width: 260, height: 160 } }, onCode, () => {});
+    $("startBtn").style.display = "none"; $("stopBtn").style.display = "block";
+  } catch(e) {
+    scanner = null;
+    setResult("bad", "Camera error", String(e));
+  }
+}
+async function stopScanner() {
+  if (!scanner) return;
+  try { await scanner.stop(); scanner.clear(); } catch(e) {}
+  scanner = null;
+  $("startBtn").style.display = "block"; $("stopBtn").style.display = "none";
+}
+$("startBtn").onclick = startScanner;
+$("stopBtn").onclick = stopScanner;
+
+// ---------- list ----------
+function renderList() {
+  const q = $("filter").value.toLowerCase();
+  const done = orders.filter(o => scanned[o.num]).length;
+  $("count").textContent = "Scanned " + done + " / " + orders.length;
+  const box = $("rows"); box.innerHTML = "";
+  orders.filter(o => !q || o.num.toLowerCase().includes(q) || o.name.toLowerCase().includes(q))
+    .forEach(o => {
+      const d = document.createElement("div");
+      d.className = "row" + (scanned[o.num] ? " done" : "");
+      d.innerHTML = '<span class="num"></span><span class="name"></span><span class="st"></span>';
+      d.children[0].textContent = o.num;
+      d.children[1].textContent = o.name;
+      d.children[2].textContent = scanned[o.num] ? "✅" : "⬜";
+      box.appendChild(d);
+    });
+}
+$("filter").oninput = renderList;
+$("resetBtn").onclick = () => {
+  if (confirm("Reset all scanned status?")) { scanned = {}; store.set("scanned", scanned); renderList(); }
+};
+</script>
+</body>
+</html>
